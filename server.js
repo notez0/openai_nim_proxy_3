@@ -288,7 +288,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream
     } = req.body;
 
-    const primaryModel = MODEL_MAPPING[model] || 'glm-5.3': 'z-ai/glm-5.3';
+    const primaryModel = MODEL_MAPPING[model] || 'z-ai/glm-5.3';
     const modelChain = [primaryModel];
 
     const baseRequest = {
