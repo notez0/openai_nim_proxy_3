@@ -48,14 +48,13 @@ validateConfig();
 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/nemotron-3-super-120b-a12b',
-  'gpt-3.5-ultra': 'nvidia/nemotron-3-ultra-550b-a55b',
-  'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct',
+  'gpt-4': 'nvidia/nemotron-3-ultra-550b-a55b',
   'gpt-3.5': 'qwen/qwen3.5-397b-a17b',
-  'gpt-4-turbo': 'moonshotai/kimi-k2.6',
-  'gpt-4o': 'deepseek-ai/deepseek-v4-pro',
+  'gpt-4-turbo': 'moonshotai/kimi-k3',
+  'gpt-4o': 'deepseek-ai/deepseek-v4-pro-0813',
   'claude-3-opus': 'openai/gpt-oss-120b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
-  'gemini-pro': 'nvidia/llama-3.3-nemotron-super-49b-v1.5',
+  'gemini-pro': 'deepseek-ai/deepseek-v4',
   'gemini-turbo': 'meta/llama-3.3-70b-instruct',
   'gemini-turbo?': 'abacusai/dracarys-llama-3.1-70b-instruct',
   'gpt-3.5o': 'nvidia/nemotron-mini-4b-instruct',
@@ -70,6 +69,7 @@ const MODEL_MAPPING = {
   'google-lightest': 'google/gemma-2-2b-it',
   'google-lighter': 'google/gemma-3n-e4b-it',
   'm2.7': 'minimaxai/minimax-m2.7',
+  'm3': 'minimaxai/minimax-m3',
   'step-3.5-flash': 'stepfun-ai/step-3.5-flash',
   'step-3.7-flash': 'stepfun-ai/step-3.7-flash'
 };
@@ -77,7 +77,6 @@ const MODEL_MAPPING = {
 const FALLBACK_MODELS = [
   'mistralai/mistral-medium-3.5-128b',
   'mistralai/mistral-small-4-119b-2603',
-  'nvidia/llama-3.3-nemotron-super-49b-v1.5',
   'google/gemma-4-31b-it'
 ];
 
@@ -289,7 +288,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream
     } = req.body;
 
-    const primaryModel = MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
+    const primaryModel = MODEL_MAPPING[model] || 'moonshotai/kimi-k3';
     const modelChain = [primaryModel];
 
     const baseRequest = {
