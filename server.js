@@ -1,9 +1,11 @@
 // server.js — Robust Hybrid OpenAI ↔ NIM Proxy (Express 5 Compatible)
+// Fixes: Auth bypass, startup DDoS, silent stream failures, memory leaks, Express 5 deprecations, HTTP 500 & Timeout Retries
 
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const crypto = require('crypto');
+const https = require('https');
 const { StringDecoder } = require('string_decoder');
 
 const app = express();
@@ -21,9 +23,17 @@ const SKIP_VALIDATION = process.env.SKIP_VALIDATION === 'true';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
 const MAX_TOKENS_LIMIT = 65536;
-const REQUEST_TIMEOUT_MS = 180000;
+// Reduzido para 35s (35000ms) para falhar rápido e retentar caso o worker da GPU congele
+const REQUEST_TIMEOUT_MS = process.env.REQUEST_TIMEOUT_MS ? parseInt(process.env.REQUEST_TIMEOUT_MS) : 35000;
 const VALIDATION_TIMEOUT_MS = 15000;
 const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
+
+// Agente HTTPS otimizado com conexões persistentes (Keep-Alive)
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  timeout: REQUEST_TIMEOUT_MS,
+  freeSocketTimeout: 30000
+});
 
 if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
 if (ENABLE_THINKING_MODE) console.log('[CONFIG] Thinking mode: ENABLED');
@@ -93,7 +103,6 @@ app.use((req, res, next) => {
     return next();
   }
 
-  // Se CLIENT_AUTH_KEY estiver definida, valida o token
   if (CLIENT_AUTH_KEY) {
     const token = extractBearerToken(req.headers.authorization);
     if (!token || !safeTimingEqual(token, CLIENT_AUTH_KEY)) {
@@ -136,7 +145,10 @@ async function postWithRetry(url, data, config, maxRetries = 3, baseDelayMs = 10
       await parseAxiosStreamError(err);
 
       const status = err.response?.status;
-      const isRetryable = !status || status >= 500 || status === 429;
+      const isTimeout = err.code === 'ECONNABORTED' || err.message?.includes('timeout');
+      
+      // Retenta em caso de Erro 5xx, Rate Limit (429), falta de resposta ou Timeout (ECONNABORTED)
+      const isRetryable = !status || status >= 500 || status === 429 || isTimeout;
       const isLastAttempt = attempt === maxRetries;
 
       if (!isRetryable || isLastAttempt) {
@@ -145,9 +157,10 @@ async function postWithRetry(url, data, config, maxRetries = 3, baseDelayMs = 10
 
       const jitter = Math.random() * 1000;
       const delay = (baseDelayMs * Math.pow(2, attempt)) + jitter;
+      const errorCause = isTimeout ? 'Timeout de conexão atingido' : `Status ${status || err.code}`;
 
       console.warn(
-        `[RETRY] Tentativa ${attempt + 1}/${maxRetries} falhou (${status || err.code}). Retentando em ${Math.round(delay)}ms...`
+        `[RETRY] Tentativa ${attempt + 1}/${maxRetries} falhou (${errorCause}). Retentando em ${Math.round(delay)}ms...`
       );
 
       await new Promise(resolve => setTimeout(resolve, delay));
@@ -165,7 +178,8 @@ async function executeRequest(baseRequest) {
         'Content-Type': 'application/json'
       },
       responseType: baseRequest.stream ? 'stream' : 'json',
-      timeout: REQUEST_TIMEOUT_MS
+      timeout: REQUEST_TIMEOUT_MS,
+      httpsAgent // Aplica o agente HTTPS com Keep-Alive
     },
     3,
     1000
@@ -202,7 +216,8 @@ async function validateModels() {
         Authorization: `Bearer ${NIM_API_KEY}`,
         'Content-Type': 'application/json'
       },
-      timeout: VALIDATION_TIMEOUT_MS
+      timeout: VALIDATION_TIMEOUT_MS,
+      httpsAgent
     });
 
     const availableModels = new Set(
@@ -250,7 +265,7 @@ async function sendDiscordAlert(invalidModels) {
     await axios.post(DISCORD_WEBHOOK_URL, {
       embeds: [embed],
       username: 'NIM Proxy Monitor'
-    }, { timeout: 5000 });
+    }, { timeout: 5000, httpsAgent });
     console.log('[DISCORD] Alert sent.');
   } catch (err) {
     console.error('[DISCORD] Failed to send alert:', err.message);
@@ -260,7 +275,7 @@ async function sendDiscordAlert(invalidModels) {
 // ─── Routes ────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '2.2.0' });
+  res.json({ status: 'ok', version: '2.3.0' });
 });
 
 app.get('/v1/models', (req, res) => {
@@ -287,7 +302,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       max_tokens,
       max_completion_tokens,
       stream,
-      ...extraParams // Preserva parâmetros adicionais como tools, top_p, stop, etc.
+      ...extraParams
     } = req.body;
 
     const targetModel = MODEL_MAPPING[model] || model || 'z-ai/glm-5.3';
@@ -513,8 +528,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   } catch (error) {
     const errorDetails = error.response?.data || error.message;
     console.error('[PROXY] Fatal error:', error.message);
-    
-    // Evita crash de circular structure no JSON.stringify caso errorDetails seja uma Stream do Node
+
     if (typeof errorDetails === 'object' && typeof errorDetails.pipe !== 'function') {
       console.error('[PROXY] NIM response details:', JSON.stringify(errorDetails, null, 2));
     } else {
@@ -562,7 +576,7 @@ app.use((req, res) => {
 
 app.listen(PORT, () => {
   console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
-  console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
+  console.log(`[PROXY] Request timeout set to: ${REQUEST_TIMEOUT_MS}ms`);
   
   validateModels().catch(err => {
     console.error('[VALIDATION] Startup check failed:', err.message);
