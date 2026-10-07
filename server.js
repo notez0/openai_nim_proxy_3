@@ -1,10 +1,12 @@
-// server.js — Robust Hybrid OpenAI ↔ NIM Proxy (Express 5 Compatible)
+// server.js — Robust Hybrid OpenAI ↔ NIM Proxy
+// Express 5 Compatible
+// Fixes: auth bypass, startup DDoS, silent stream failures, memory leaks, Express 5 deprecations
 
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const crypto = require('crypto');
 const { StringDecoder } = require('string_decoder');
+const { timingSafeEqual } = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -28,13 +30,15 @@ const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
 if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
 if (ENABLE_THINKING_MODE) console.log('[CONFIG] Thinking mode: ENABLED');
 
+// ─── Config validation ──────────────────────────────────────────────────────
+
 function validateConfig() {
-  if (!NIM_API_KEY) {
-    console.error('[FATAL] NIM_API_KEY is required. Get one at https://build.nvidia.com/');
-    process.exit(1);
-  }
+  const fatal = (msg) => { console.error(`[FATAL] ${msg}`); process.exit(1); };
+  
+  if (!NIM_API_KEY) fatal('NIM_API_KEY is required. Get one at https://build.nvidia.com/');
+  
   if (!CLIENT_AUTH_KEY) {
-    console.warn('[WARN] CLIENT_AUTH_KEY not set. Authentication middleware will be DISABLED.');
+    console.warn('[WARN] CLIENT_AUTH_KEY not set. All requests will be rejected with 403.');
   }
 }
 
@@ -52,6 +56,7 @@ const MODEL_MAPPING = {
   'claude-3-sonnet': 'openai/gpt-oss-20b',
   'gemini-pro': 'deepseek-ai/deepseek-v4',
   'gemini-turbo': 'meta/llama-3.3-70b-instruct',
+  'gemini-turbo?': 'abacusai/dracarys-llama-3.1-70b-instruct',
   'gpt-3.5o': 'nvidia/nemotron-mini-4b-instruct',
   'gpt-4-flash': 'deepseek-ai/deepseek-v4-flash',
   'glm-5.3': 'z-ai/glm-5.3',
@@ -69,11 +74,19 @@ const MODEL_MAPPING = {
   'step-3.7-flash': 'stepfun-ai/step-3.7-flash'
 };
 
+const FALLBACK_MODELS = [
+  'mistralai/mistral-medium-3.5-128b',
+  'mistralai/mistral-small-4-119b-2603',
+  'google/gemma-4-31b-it'
+];
+
 // ─── Middleware ─────────────────────────────────────────────────────────────
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// FIX: Extract token AFTER "Bearer " prefix, compare only the token
+// Prevents bypass when CLIENT_AUTH_KEY is empty (expected would be "Bearer " which is 7 chars)
 function extractBearerToken(authHeader) {
   if (!authHeader || typeof authHeader !== 'string') return null;
   const parts = authHeader.trim().split(' ');
@@ -82,10 +95,12 @@ function extractBearerToken(authHeader) {
 }
 
 function safeTimingEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const hashA = crypto.createHash('sha256').update(a).digest();
-  const hashB = crypto.createHash('sha256').update(b).digest();
-  return crypto.timingSafeEqual(hashA, hashB);
+  if (!a || !b || a.length !== b.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  } catch {
+    return false;
+  }
 }
 
 app.use((req, res, next) => {
@@ -93,101 +108,35 @@ app.use((req, res, next) => {
     return next();
   }
 
-  // Se CLIENT_AUTH_KEY estiver definida, valida o token
-  if (CLIENT_AUTH_KEY) {
-    const token = extractBearerToken(req.headers.authorization);
-    if (!token || !safeTimingEqual(token, CLIENT_AUTH_KEY)) {
-      return res.status(401).json({
-        error: {
-          message: 'Unauthorized: Invalid or missing authentication credentials',
-          type: 'authentication_error',
-          code: 401
-        }
-      });
-    }
+  const token = extractBearerToken(req.headers.authorization);
+  
+  if (!token || !CLIENT_AUTH_KEY) {
+    return res.status(403).json({
+      error: {
+        message: 'Forbidden: Invalid or missing authentication',
+        type: 'authentication_error',
+        code: 403
+      }
+    });
+  }
+
+  if (!safeTimingEqual(token, CLIENT_AUTH_KEY)) {
+    return res.status(403).json({
+      error: {
+        message: 'Forbidden: Invalid authentication credentials',
+        type: 'authentication_error',
+        code: 403
+      }
+    });
   }
 
   next();
 });
 
-// ─── Helpers: Error & Retry Handling ─────────────────────────────────────
-
-async function parseAxiosStreamError(err) {
-  if (err.response?.data && typeof err.response.data.pipe === 'function') {
-    try {
-      const chunks = [];
-      for await (const chunk of err.response.data) {
-        chunks.push(chunk);
-      }
-      const raw = Buffer.concat(chunks).toString('utf8');
-      err.response.data = JSON.parse(raw);
-    } catch {
-      if (err.response?.data?.destroy) err.response.data.destroy();
-      err.response.data = { error: { message: 'Failed to parse stream error response' } };
-    }
-  }
-}
-
-async function postWithRetry(url, data, config, maxRetries = 3, baseDelayMs = 1000) {
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await axios.post(url, data, config);
-    } catch (err) {
-      await parseAxiosStreamError(err);
-
-      const status = err.response?.status;
-      const isRetryable = !status || status >= 500 || status === 429;
-      const isLastAttempt = attempt === maxRetries;
-
-      if (!isRetryable || isLastAttempt) {
-        throw err;
-      }
-
-      const jitter = Math.random() * 1000;
-      const delay = (baseDelayMs * Math.pow(2, attempt)) + jitter;
-
-      console.warn(
-        `[RETRY] Tentativa ${attempt + 1}/${maxRetries} falhou (${status || err.code}). Retentando em ${Math.round(delay)}ms...`
-      );
-
-      await new Promise(resolve => setTimeout(resolve, delay));
-    }
-  }
-}
-
-async function executeRequest(baseRequest) {
-  const res = await postWithRetry(
-    `${NIM_API_BASE}/chat/completions`,
-    baseRequest,
-    {
-      headers: {
-        Authorization: `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      responseType: baseRequest.stream ? 'stream' : 'json',
-      timeout: REQUEST_TIMEOUT_MS
-    },
-    3,
-    1000
-  );
-
-  return { response: res, model: baseRequest.model };
-}
-
-function safeWrite(res, data) {
-  try {
-    if (!res.writableEnded && !res.destroyed && res.writable) {
-      res.write(data);
-      return true;
-    }
-  } catch (err) {
-    console.warn('[STREAM] Write failed:', err.message);
-  }
-  return false;
-}
-
 // ─── Validation ─────────────────────────────────────────────────────────────
 
+// FIX: Use lightweight model listing instead of burning inference quota
+// If NIM doesn't support /models, skip validation entirely rather than DDoS-ing yourself
 async function validateModels() {
   if (SKIP_VALIDATION) {
     console.log('[VALIDATION] Skipped (SKIP_VALIDATION=true)');
@@ -213,9 +162,9 @@ async function validateModels() {
     
     for (const [alias, nimId] of Object.entries(MODEL_MAPPING)) {
       if (availableModels.has(nimId)) {
-        console.log(`[VALIDATION] ✓ ${alias} →${nimId}`);
+        console.log(`[VALIDATION] ✓ ${alias} → ${nimId}`);
       } else {
-        console.warn(`[VALIDATION] ✗ ${alias} →${nimId} (not in catalog)`);
+        console.warn(`[VALIDATION] ✗ ${alias} → ${nimId} (not in catalog)`);
         invalid.push({ alias, nimId, error: 'Model not found in NIM catalog' });
       }
     }
@@ -228,6 +177,7 @@ async function validateModels() {
 
   } catch (err) {
     console.warn(`[VALIDATION] /v1/models endpoint failed: ${err.message}. Skipping validation.`);
+    console.warn('[VALIDATION] Consider setting SKIP_VALIDATION=true if your NIM provider lacks a model listing endpoint.');
   }
 }
 
@@ -257,10 +207,60 @@ async function sendDiscordAlert(invalidModels) {
   }
 }
 
+// ─── Helper: Safe Stream Writing ───────────────────────────────────────────
+
+// FIX: Wrap res.write in try/catch to prevent crashes on closed sockets
+function safeWrite(res, data) {
+  try {
+    if (!res.writableEnded && !res.destroyed && res.writable) {
+      res.write(data);
+      return true;
+    }
+  } catch (err) {
+    console.warn('[STREAM] Write failed:', err.message);
+  }
+  return false;
+}
+
+// ─── Helper: Fallback Chain ─────────────────────────────────────────────────
+
+async function callWithFallback(baseRequest, models) {
+  let lastError = null;
+
+  for (const model of models) {
+    try {
+      const res = await axios.post(
+        `${NIM_API_BASE}/chat/completions`,
+        { ...baseRequest, model },
+        {
+          headers: {
+            Authorization: `Bearer ${NIM_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          responseType: baseRequest.stream ? 'stream' : 'json',
+          timeout: REQUEST_TIMEOUT_MS
+        }
+      );
+
+      return { response: res, model };
+
+    } catch (err) {
+      lastError = err;
+      console.warn(
+        `[FALLBACK] Model failed: ${model}`,
+        err.response?.status,
+        err.response?.data?.error?.message || err.message
+      );
+    }
+  }
+
+  throw lastError || new Error('All models failed');
+}
+
 // ─── Routes ────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '2.2.0' });
+  res.json({ status: 'ok', version: '2.1.0' });
 });
 
 app.get('/v1/models', (req, res) => {
@@ -285,33 +285,23 @@ app.post('/v1/chat/completions', async (req, res) => {
       messages,
       temperature,
       max_tokens,
-      max_completion_tokens,
-      stream,
-      ...extraParams // Preserva parâmetros adicionais como tools, top_p, stop, etc.
+      stream
     } = req.body;
 
-    const targetModel = MODEL_MAPPING[model] || model || 'z-ai/glm-5.3';
-    const requestedMaxTokens = max_completion_tokens ?? max_tokens;
+    const primaryModel = MODEL_MAPPING[model] || 'z-ai/glm-5.3';
+    const modelChain = [primaryModel];
 
     const baseRequest = {
-      ...extraParams,
-      model: targetModel,
       messages,
       temperature: temperature ?? 0.7,
-      max_tokens: Math.min(requestedMaxTokens ?? 4096, MAX_TOKENS_LIMIT),
+      max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
       stream: stream || false,
-      ...(ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : {})
+      extra_body: ENABLE_THINKING_MODE
+        ? { chat_template_kwargs: { thinking: true } }
+        : undefined
     };
 
-    const { response, model: usedModel } = await executeRequest(baseRequest);
-
-    if (req.destroyed || res.destroyed) {
-      if (response.data && typeof response.data.destroy === 'function') {
-        response.data.destroy();
-      }
-      return;
-    }
-
+    const { response, model: usedModel } = await callWithFallback(baseRequest, modelChain);
     upstreamStream = response.data;
     console.log('[PROXY] Model used:', usedModel);
 
@@ -335,19 +325,10 @@ app.post('/v1/chat/completions', async (req, res) => {
         req.removeAllListeners('close');
       };
 
-      const processLine = (rawLine) => {
-        const line = rawLine.replace(/\r$/, '').trim();
-        if (!line.startsWith('data:')) return;
+      const processLine = (line) => {
+        if (!line.startsWith('data: ')) return;
 
-        const dataStr = line.slice(5).trim();
-
-        if (dataStr === '[DONE]') {
-          if (reasoningOpen) {
-            safeWrite(res, `data: ${JSON.stringify({
-              choices: [{ delta: { content: '\n</thinking>\n\n' } }]
-            })}\n\n`);
-            reasoningOpen = false;
-          }
+        if (line.includes('[DONE]')) {
           if (!doneSent) {
             safeWrite(res, 'data: [DONE]\n\n');
             doneSent = true;
@@ -357,44 +338,43 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
 
         try {
-          const data = JSON.parse(dataStr);
+          const data = JSON.parse(line.slice(6));
           const delta = data.choices?.[0]?.delta;
 
           if (delta) {
-            let formattedContent = '';
+            let content = delta.content || '';
             const reasoning = delta.reasoning_content;
-            const rawContent = delta.content || '';
 
             if (SHOW_REASONING) {
-              if (reasoning) {
-                if (!reasoningOpen) {
-                  formattedContent += `<thinking>\n${reasoning}`;
-                  reasoningOpen = true;
-                } else {
-                  formattedContent += reasoning;
-                }
+              if (reasoning && !reasoningOpen) {
+                content = `<thinking>\n${reasoning.replace(/\n/g, '\\n')}`;
+                reasoningOpen = true;
+              } else if (reasoning) {
+                content = reasoning.replace(/\n/g, '\\n');
               }
 
-              if (rawContent) {
-                if (reasoningOpen) {
-                  formattedContent += `\n</thinking>\n\n${rawContent}`;
-                  reasoningOpen = false;
-                } else {
-                  formattedContent += rawContent;
-                }
+              if (delta.content && reasoningOpen) {
+                content += `\n</thinking>\n\n${delta.content}`;
+                reasoningOpen = false;
               }
-            } else {
-              formattedContent = rawContent;
             }
 
-            delta.content = formattedContent;
+            delta.content = content;
             delete delta.reasoning_content;
           }
 
           safeWrite(res, `data: ${JSON.stringify(data)}\n\n`);
 
         } catch (parseErr) {
+          // FIX: Don't silently swallow—send error to client so they know data was lost
           console.warn('[STREAM] Invalid JSON line:', line.slice(0, 100));
+          safeWrite(res, `data: ${JSON.stringify({ 
+            error: { 
+              message: 'Upstream sent malformed chunk', 
+              type: 'stream_parse_error',
+              details: line.slice(0, 100)
+            } 
+          })}\n\n`);
         }
       };
 
@@ -404,7 +384,10 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (buffer.length > MAX_BUFFER_SIZE) {
           console.error('[STREAM] Buffer overflow, destroying connection');
           safeWrite(res, `data: ${JSON.stringify({ 
-            error: { message: 'Stream buffer overflow', type: 'stream_error' } 
+            error: { 
+              message: 'Stream buffer overflow', 
+              type: 'stream_error' 
+            } 
           })}\n\n`);
           safeWrite(res, 'data: [DONE]\n\n');
           res.end();
@@ -428,13 +411,6 @@ app.post('/v1/chat/completions', async (req, res) => {
           for (const line of buffer.split('\n')) {
             processLine(line);
           }
-        }
-
-        if (reasoningOpen) {
-          safeWrite(res, `data: ${JSON.stringify({
-            choices: [{ delta: { content: '\n</thinking>\n\n' } }]
-          })}\n\n`);
-          reasoningOpen = false;
         }
 
         if (!doneSent) {
@@ -464,6 +440,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         cleanup();
       });
 
+      // FIX: Check req.destroyed (Node/Express 5) 
+      // Don't destroy already-finished streams
       req.on('close', () => {
         const clientGone = req.destroyed || !res.writable;
         
@@ -478,16 +456,18 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
 
     } else {
+      // Non-streaming response
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: model,
         choices: (response.data.choices || []).map((choice, i) => {
-          let content = choice.message?.content ?? '';
+          let content = choice.message?.content || '';
 
           if (SHOW_REASONING && choice.message?.reasoning_content) {
-            content = `<thinking>\n${choice.message.reasoning_content}\n</thinking>\n\n${content}`;
+            const safeReasoning = choice.message.reasoning_content.replace(/\n/g, '\\n');
+            content = `<thinking>\n${safeReasoning}\n</thinking>\n\n${content}`;
           }
 
           return {
@@ -495,7 +475,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             message: {
               role: choice.message?.role || 'assistant',
               content,
-              ...(choice.message?.tool_calls ? { tool_calls: choice.message.tool_calls } : {})
+              tool_calls: choice.message?.tool_calls
             },
             finish_reason: choice.finish_reason || 'stop'
           };
@@ -511,22 +491,13 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
   } catch (error) {
-    const errorDetails = error.response?.data || error.message;
     console.error('[PROXY] Fatal error:', error.message);
-    
-    // Evita crash de circular structure no JSON.stringify caso errorDetails seja uma Stream do Node
-    if (typeof errorDetails === 'object' && typeof errorDetails.pipe !== 'function') {
-      console.error('[PROXY] NIM response details:', JSON.stringify(errorDetails, null, 2));
-    } else {
-      console.error('[PROXY] NIM response details:', errorDetails);
-    }
+    console.error('[PROXY] NIM response:', error.response?.data);
 
     if (!res.headersSent) {
       res.status(error.response?.status || 500).json({
         error: {
-          message: typeof errorDetails === 'object' && errorDetails.error?.message
-            ? errorDetails.error.message
-            : error.message,
+          message: error.message,
           type: 'invalid_request_error',
           code: error.response?.status || 500
         }
@@ -542,12 +513,14 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.end();
     }
 
+    // Clean up upstream stream if we have it
     if (upstreamStream && !upstreamStream.destroyed) {
       upstreamStream.destroy();
     }
   }
 });
 
+// FIX: Express 5 named wildcard — but use proper 404 handler
 app.use((req, res) => {
   res.status(404).json({
     error: {
@@ -564,7 +537,9 @@ app.listen(PORT, () => {
   console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
   console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
   
+  // Run validation after server starts, non-blocking
   validateModels().catch(err => {
     console.error('[VALIDATION] Startup check failed:', err.message);
   });
 });
+  
