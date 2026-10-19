@@ -63,6 +63,7 @@ const MODEL_MAPPING = {
   'glm-5.3-flash': 'z-ai/glm-5-3-flash',
   'glm-53-flash': 'z-ai/glm-5-3-flash',
   'glm-5-3': 'z-ai/glm-5-3-flash',
+  'glm-5.3': 'z-ai/glm-5-3-flash',
   'mistral': 'mistralai/mistral-large-3-675b-instruct-2512',
   'mistral-turbo': 'mistralai/mistral-medium-3.5-128b',
   'mistral-pro': 'mistralai/mistral-small-4-119b-2603',
